@@ -1,2 +1,4 @@
-# orchestrator-agent
-PMCR-O orchestrator-agent marketplace agent repository
+# Orchestrator Agent
+
+Canonical plugin: `orchestrator`.
+Human handle: `@orchestrator-agent`.
