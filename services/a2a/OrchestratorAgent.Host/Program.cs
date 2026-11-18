@@ -14,11 +14,11 @@ builder.Services.AddKeyedSingleton<AIAgent>(AgentName, (services, _) =>
         instructions:
             "You are the PMCR-O Orchestrator transport proof. " +
             "When downstream role services are configured, dispatch the bounded transport chain in PMCR-O order. " +
-            "Never claim role reasoning/provider execution.",
+            "Preserve PMCR-O correlation exactly and never claim role reasoning/provider execution.",
         name: AgentName,
         description:
-            "PMCR-O global lifecycle owner. Can prove A2A dispatch to Planner, Maker, Checker and Reflector " +
-            "while every role reasoning/provider remains NOT_INVOKED.",
+            "PMCR-O global lifecycle owner. Proves A2A dispatch and correlation preservation while " +
+            "every role reasoning/provider remains NOT_INVOKED.",
         services: services));
 
 builder.AddA2AServer(AgentName);
@@ -48,7 +48,8 @@ app.MapGet("/healthz", () => Results.Ok(new
     provider = "transport-proof",
     execution = "NOT_INVOKED",
     reasoning_provider = "NOT_INVOKED",
-    dispatch_chain = dispatchConfigured ? "CONFIGURED" : "NOT_CONFIGURED"
+    dispatch_chain = dispatchConfigured ? "CONFIGURED" : "NOT_CONFIGURED",
+    correlation = "SUPPORTED"
 }));
 
 app.MapA2AHttpJson(AgentName, A2APath);
@@ -58,9 +59,9 @@ app.MapWellKnownAgentCard(new AgentCard
 {
     Name = "PMCR-O Orchestrator Agent",
     Description =
-        "Owns global PMCR-O lifecycle routing. The proof host may dispatch the A2A role chain, " +
-        "but does not execute role reasoning/providers.",
-    Version = "1.1.0",
+        "Owns global PMCR-O lifecycle routing. The proof host may dispatch the A2A role chain " +
+        "and preserve a PMCR-O correlation envelope, but it does not execute role reasoning/providers.",
+    Version = "1.2.0",
     DefaultInputModes = ["text"],
     DefaultOutputModes = ["text"],
     SupportedInterfaces =
@@ -78,6 +79,8 @@ app.Run();
 
 internal sealed class DispatchChainProofChatClient(IConfiguration configuration) : IChatClient
 {
+    private const string CorrelationPrefix = "PMCRO_CORRELATION ";
+
     private static readonly (string Role, string Key)[] Downstream =
     [
         ("planner", "A2A_DOWNSTREAM_PLANNER"),
@@ -96,7 +99,7 @@ internal sealed class DispatchChainProofChatClient(IConfiguration configuration)
         ChatOptions? options = null,
         CancellationToken cancellationToken = default)
     {
-        var text = await RunDispatchAsync(cancellationToken);
+        var text = await RunDispatchAsync(messages, cancellationToken);
         return new ChatResponse(new ChatMessage(ChatRole.Assistant, text));
     }
 
@@ -105,13 +108,19 @@ internal sealed class DispatchChainProofChatClient(IConfiguration configuration)
         ChatOptions? options = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var text = await RunDispatchAsync(cancellationToken);
+        var text = await RunDispatchAsync(messages, cancellationToken);
         yield return new ChatResponseUpdate(ChatRole.Assistant, text);
     }
 
-    private async Task<string> RunDispatchAsync(CancellationToken cancellationToken)
+    private async Task<string> RunDispatchAsync(
+        IEnumerable<ChatMessage> messages,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+
+        var correlation = messages
+            .Select(message => message.Text)
+            .LastOrDefault(text => text.StartsWith(CorrelationPrefix, StringComparison.Ordinal));
 
         var targets = new List<(string Role, Uri Url)>();
         foreach (var (role, key) in Downstream)
@@ -119,7 +128,9 @@ internal sealed class DispatchChainProofChatClient(IConfiguration configuration)
             var raw = configuration[key];
             if (!Uri.TryCreate(raw, UriKind.Absolute, out var uri))
             {
-                return StandaloneDisposition;
+                return correlation is null
+                    ? StandaloneDisposition
+                    : StandaloneDisposition + " " + correlation;
             }
             targets.Add((role, uri));
         }
@@ -131,9 +142,12 @@ internal sealed class DispatchChainProofChatClient(IConfiguration configuration)
 
             var resolver = new A2ACardResolver(url);
             AIAgent remoteAgent = await resolver.GetAIAgentAsync();
-            AgentResponse response = await remoteAgent.RunAsync(
-                $"PMCR-O A2A dispatch proof from orchestrator-agent to {role}-agent. " +
-                "Role reasoning/provider execution must remain NOT_INVOKED.");
+
+            var downstreamRequest = correlation
+                ?? $"PMCR-O A2A dispatch proof from orchestrator-agent to {role}-agent. " +
+                   "Role reasoning/provider execution must remain NOT_INVOKED.";
+
+            AgentResponse response = await remoteAgent.RunAsync(downstreamRequest);
 
             if (!response.Text.StartsWith("NOT_INVOKED:", StringComparison.Ordinal))
             {
@@ -141,14 +155,31 @@ internal sealed class DispatchChainProofChatClient(IConfiguration configuration)
                     $"Downstream {role}-agent claimed unexpected execution: {response.Text}");
             }
 
+            if (correlation is not null &&
+                !response.Text.Contains(correlation, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Downstream {role}-agent dropped or changed the PMCR-O correlation envelope.");
+            }
+
             receipts.Add($"{role}=NOT_INVOKED");
         }
+
+        var correlationMarker = correlation is null
+            ? string.Empty
+            : "PMCRO_CORRELATION_CHAIN=PASS; ";
+
+        var correlationEcho = correlation is null
+            ? string.Empty
+            : " " + correlation;
 
         return
             "NOT_INVOKED: ORCHESTRATOR_REASONING_PROVIDER; " +
             "A2A_DISPATCH_CHAIN=PASS; " +
+            correlationMarker +
             string.Join(";", receipts) + "; " +
-            "maker_actuators=NOT_CONNECTED;checker_mutation=DISALLOWED;reflector_dispatch=false";
+            "maker_actuators=NOT_CONNECTED;checker_mutation=DISALLOWED;reflector_dispatch=false" +
+            correlationEcho;
     }
 
     public object? GetService(Type serviceType, object? serviceKey = null) =>
