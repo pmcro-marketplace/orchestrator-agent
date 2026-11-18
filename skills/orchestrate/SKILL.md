@@ -1,6 +1,6 @@
 ---
 name: orchestrate
-description: Own one established high-level goal across bounded PMCR-O cycles and route the next bounded intent.
+description: Own one established high-level goal across bounded PMCR-O cycles and route the next bounded intent. USE FOR selecting and routing the next bounded PMCR-O intent. DO NOT USE FOR planning, making, checking, or reflecting; use the corresponding PMCR-O role agent.
 ---
 # orchestrate
 
@@ -33,4 +33,4 @@ A PASS requires actual evidence. An emitted invocation, route, plan, or declared
 Emission is not invocation. The installed Hook Agent may surround this role but does not replace its business function.
 
 ## Resources
-See `references/contract.md` and `assets/request.json`.
+See `references/contract.md`, `assets/request.json`, and `scripts/validate.py`.
