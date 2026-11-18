@@ -1,0 +1,137 @@
+name: Orchestrator A2A Correlation Chain Proof
+
+on:
+  push:
+    branches: ["claude/a2a-correlation-chain"]
+  pull_request:
+    paths:
+      - "services/a2a/**"
+      - ".github/workflows/a2a-correlation-chain.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  correlation-chain-proof:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Orchestrator
+        uses: actions/checkout@v4
+
+      - name: Checkout Planner correlation proof revision
+        uses: actions/checkout@v4
+        with:
+          repository: pmcro-marketplace/planner-agent
+          ref: 137a719e176d13823b8e575165d5462bd0f2c3a5
+          path: downstream/planner
+
+      - name: Checkout Maker correlation proof revision
+        uses: actions/checkout@v4
+        with:
+          repository: pmcro-marketplace/maker-agent
+          ref: 9ead94e00cb2184170faca3e63cc14e428dd315d
+          path: downstream/maker
+
+      - name: Checkout Checker correlation proof revision
+        uses: actions/checkout@v4
+        with:
+          repository: pmcro-marketplace/checker-agent
+          ref: b2ac1f048a8b610f35aa69194cd28894a8987c88
+          path: downstream/checker
+
+      - name: Checkout Reflector correlation proof revision
+        uses: actions/checkout@v4
+        with:
+          repository: pmcro-marketplace/reflector-agent
+          ref: 5d3d2a2b20491475f6704a5872b38aa5b956dcce
+          path: downstream/reflector
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build Orchestrator and downstream hosts
+        run: |
+          dotnet build services/a2a/OrchestratorAgent.Host/OrchestratorAgent.Host.csproj -c Release --nologo
+          dotnet build services/a2a/OrchestratorAgent.Probe/OrchestratorAgent.Probe.csproj -c Release --nologo
+          dotnet build downstream/planner/services/a2a/PlannerAgent.Host/PlannerAgent.Host.csproj -c Release --nologo
+          dotnet build downstream/maker/services/a2a/MakerAgent.Host/MakerAgent.Host.csproj -c Release --nologo
+          dotnet build downstream/checker/services/a2a/CheckerAgent.Host/CheckerAgent.Host.csproj -c Release --nologo
+          dotnet build downstream/reflector/services/a2a/ReflectorAgent.Host/ReflectorAgent.Host.csproj -c Release --nologo
+
+      - name: Start downstream correlation-capable role services
+        run: |
+          ASPNETCORE_URLS=http://127.0.0.1:5092 A2A_PUBLIC_BASE_URL=http://127.0.0.1:5092 dotnet run --project downstream/planner/services/a2a/PlannerAgent.Host/PlannerAgent.Host.csproj -c Release --no-build > /tmp/planner.log 2>&1 & echo $! > /tmp/planner.pid
+          ASPNETCORE_URLS=http://127.0.0.1:5093 A2A_PUBLIC_BASE_URL=http://127.0.0.1:5093 dotnet run --project downstream/maker/services/a2a/MakerAgent.Host/MakerAgent.Host.csproj -c Release --no-build > /tmp/maker.log 2>&1 & echo $! > /tmp/maker.pid
+          ASPNETCORE_URLS=http://127.0.0.1:5094 A2A_PUBLIC_BASE_URL=http://127.0.0.1:5094 dotnet run --project downstream/checker/services/a2a/CheckerAgent.Host/CheckerAgent.Host.csproj -c Release --no-build > /tmp/checker.log 2>&1 & echo $! > /tmp/checker.pid
+          ASPNETCORE_URLS=http://127.0.0.1:5095 A2A_PUBLIC_BASE_URL=http://127.0.0.1:5095 dotnet run --project downstream/reflector/services/a2a/ReflectorAgent.Host/ReflectorAgent.Host.csproj -c Release --no-build > /tmp/reflector.log 2>&1 & echo $! > /tmp/reflector.pid
+
+      - name: Wait for downstream health
+        run: |
+          python3 - <<'PY'
+          import json,time,urllib.request
+          for role,port in [('planner',5092),('maker',5093),('checker',5094),('reflector',5095)]:
+              for _ in range(40):
+                  try:
+                      with urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz',timeout=2) as r:
+                          data=json.load(r)
+                      assert data['execution']=='NOT_INVOKED'
+                      break
+                  except Exception:
+                      time.sleep(1)
+              else:
+                  raise SystemExit(f'downstream health failed: {role}')
+          print('PASS downstream correlation-capable role services ready')
+          PY
+
+      - name: Start Orchestrator with A2A downstream routing
+        env:
+          ASPNETCORE_URLS: http://127.0.0.1:5091
+          A2A_PUBLIC_BASE_URL: http://127.0.0.1:5091
+          A2A_DOWNSTREAM_PLANNER: http://127.0.0.1:5092
+          A2A_DOWNSTREAM_MAKER: http://127.0.0.1:5093
+          A2A_DOWNSTREAM_CHECKER: http://127.0.0.1:5094
+          A2A_DOWNSTREAM_REFLECTOR: http://127.0.0.1:5095
+        run: |
+          dotnet run --project services/a2a/OrchestratorAgent.Host/OrchestratorAgent.Host.csproj -c Release --no-build > /tmp/orchestrator.log 2>&1 &
+          echo $! > /tmp/orchestrator.pid
+
+      - name: Verify Orchestrator correlation routing configuration
+        run: |
+          python3 - <<'PY'
+          import json,time,urllib.request
+          for _ in range(40):
+              try:
+                  with urllib.request.urlopen('http://127.0.0.1:5091/healthz',timeout=2) as r:
+                      data=json.load(r)
+                  if data.get('dispatch_chain')=='CONFIGURED':
+                      break
+              except Exception:
+                  pass
+              time.sleep(1)
+          else:
+              raise SystemExit('orchestrator correlation chain not configured')
+          assert data['reasoning_provider']=='NOT_INVOKED'
+          assert data['correlation']=='SUPPORTED'
+          print('PASS Orchestrator correlation routing configured')
+          PY
+
+      - name: Send one correlated inbound request through full A2A chain
+        run: dotnet run --project services/a2a/OrchestratorAgent.Probe/OrchestratorAgent.Probe.csproj -c Release --no-build -- http://127.0.0.1:5091 --chain --correlation
+
+      - name: Stop all hosts
+        if: always()
+        run: |
+          for role in orchestrator planner maker checker reflector; do
+            test ! -f /tmp/$role.pid || kill $(cat /tmp/$role.pid) 2>/dev/null || true
+            echo ==== $role ====
+            cat /tmp/$role.log 2>/dev/null || true
+          done
+
+      - name: Record correlation-chain proof
+        run: |
+          echo '## PMCR-O A2A Correlation Chain Proof' >> "$GITHUB_STEP_SUMMARY"
+          echo '- One inbound PMCR-O correlation envelope reached Orchestrator.' >> "$GITHUB_STEP_SUMMARY"
+          echo '- The exact same workspace/trail/cycle/context IDs were preserved through Planner -> Maker -> Checker -> Reflector.' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Every role provider remained NOT_INVOKED.' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Maker actuators stayed disconnected; Checker mutation stayed disallowed; Reflector did not dispatch.' >> "$GITHUB_STEP_SUMMARY"
