@@ -1,0 +1,124 @@
+name: Orchestrator A2A Dispatch Chain Proof
+
+on:
+  push:
+    branches: ["claude/a2a-dispatch-chain"]
+  pull_request:
+    paths:
+      - "services/a2a/**"
+      - ".github/workflows/a2a-dispatch-chain.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch-chain-proof:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Orchestrator
+        uses: actions/checkout@v4
+      - name: Checkout Planner proof service
+        uses: actions/checkout@v4
+        with:
+          repository: pmcro-marketplace/planner-agent
+          ref: 5b532c962714e66da569c26110396fdd2b2c92a5
+          path: downstream/planner
+      - name: Checkout Maker proof service
+        uses: actions/checkout@v4
+        with:
+          repository: pmcro-marketplace/maker-agent
+          ref: 6e393b4553dfa1677e1030c9d59dbef46bd705ba
+          path: downstream/maker
+      - name: Checkout Checker proof service
+        uses: actions/checkout@v4
+        with:
+          repository: pmcro-marketplace/checker-agent
+          ref: 773c94530c9dd9fe2f4f275ad5f3fbb7b19a4db2
+          path: downstream/checker
+      - name: Checkout Reflector proof service
+        uses: actions/checkout@v4
+        with:
+          repository: pmcro-marketplace/reflector-agent
+          ref: 4c0add58f6968ea2d95d11298139e39a90f7435e
+          path: downstream/reflector
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Build Orchestrator host and client probe
+        run: |
+          dotnet build services/a2a/OrchestratorAgent.Host/OrchestratorAgent.Host.csproj -c Release --nologo
+          dotnet build services/a2a/OrchestratorAgent.Probe/OrchestratorAgent.Probe.csproj -c Release --nologo
+      - name: Build downstream role hosts
+        run: |
+          dotnet build downstream/planner/services/a2a/PlannerAgent.Host/PlannerAgent.Host.csproj -c Release --nologo
+          dotnet build downstream/maker/services/a2a/MakerAgent.Host/MakerAgent.Host.csproj -c Release --nologo
+          dotnet build downstream/checker/services/a2a/CheckerAgent.Host/CheckerAgent.Host.csproj -c Release --nologo
+          dotnet build downstream/reflector/services/a2a/ReflectorAgent.Host/ReflectorAgent.Host.csproj -c Release --nologo
+      - name: Start downstream A2A role services
+        run: |
+          ASPNETCORE_URLS=http://127.0.0.1:5092 A2A_PUBLIC_BASE_URL=http://127.0.0.1:5092 dotnet run --project downstream/planner/services/a2a/PlannerAgent.Host/PlannerAgent.Host.csproj -c Release --no-build > /tmp/planner.log 2>&1 & echo $! > /tmp/planner.pid
+          ASPNETCORE_URLS=http://127.0.0.1:5093 A2A_PUBLIC_BASE_URL=http://127.0.0.1:5093 dotnet run --project downstream/maker/services/a2a/MakerAgent.Host/MakerAgent.Host.csproj -c Release --no-build > /tmp/maker.log 2>&1 & echo $! > /tmp/maker.pid
+          ASPNETCORE_URLS=http://127.0.0.1:5094 A2A_PUBLIC_BASE_URL=http://127.0.0.1:5094 dotnet run --project downstream/checker/services/a2a/CheckerAgent.Host/CheckerAgent.Host.csproj -c Release --no-build > /tmp/checker.log 2>&1 & echo $! > /tmp/checker.pid
+          ASPNETCORE_URLS=http://127.0.0.1:5095 A2A_PUBLIC_BASE_URL=http://127.0.0.1:5095 dotnet run --project downstream/reflector/services/a2a/ReflectorAgent.Host/ReflectorAgent.Host.csproj -c Release --no-build > /tmp/reflector.log 2>&1 & echo $! > /tmp/reflector.pid
+      - name: Wait for downstream health
+        run: |
+          python3 - <<'PY'
+          import json,time,urllib.request
+          for role,port in [('planner',5092),('maker',5093),('checker',5094),('reflector',5095)]:
+              for _ in range(40):
+                  try:
+                      with urllib.request.urlopen(f'http://127.0.0.1:{port}/healthz',timeout=2) as r:
+                          data=json.load(r)
+                      assert data['execution']=='NOT_INVOKED'
+                      break
+                  except Exception:
+                      time.sleep(1)
+              else:
+                  raise SystemExit(f'downstream health failed: {role}')
+          print('PASS downstream role services ready')
+          PY
+      - name: Start Orchestrator with A2A downstream routing
+        env:
+          ASPNETCORE_URLS: http://127.0.0.1:5091
+          A2A_PUBLIC_BASE_URL: http://127.0.0.1:5091
+          A2A_DOWNSTREAM_PLANNER: http://127.0.0.1:5092
+          A2A_DOWNSTREAM_MAKER: http://127.0.0.1:5093
+          A2A_DOWNSTREAM_CHECKER: http://127.0.0.1:5094
+          A2A_DOWNSTREAM_REFLECTOR: http://127.0.0.1:5095
+        run: |
+          dotnet run --project services/a2a/OrchestratorAgent.Host/OrchestratorAgent.Host.csproj -c Release --no-build > /tmp/orchestrator.log 2>&1 &
+          echo $! > /tmp/orchestrator.pid
+      - name: Verify Orchestrator dispatch configuration
+        run: |
+          python3 - <<'PY'
+          import json,time,urllib.request
+          for _ in range(40):
+              try:
+                  with urllib.request.urlopen('http://127.0.0.1:5091/healthz',timeout=2) as r:
+                      data=json.load(r)
+                  if data.get('dispatch_chain')=='CONFIGURED': break
+              except Exception:
+                  pass
+              time.sleep(1)
+          else:
+              raise SystemExit('orchestrator dispatch chain not configured')
+          assert data['reasoning_provider']=='NOT_INVOKED'
+          print('PASS Orchestrator dispatch chain configured')
+          PY
+      - name: Send one inbound A2A request through full downstream chain
+        run: dotnet run --project services/a2a/OrchestratorAgent.Probe/OrchestratorAgent.Probe.csproj -c Release --no-build -- http://127.0.0.1:5091 --chain
+      - name: Stop all hosts
+        if: always()
+        run: |
+          for role in orchestrator planner maker checker reflector; do
+            test ! -f /tmp/$role.pid || kill $(cat /tmp/$role.pid) 2>/dev/null || true
+            echo ==== $role ====
+            cat /tmp/$role.log 2>/dev/null || true
+          done
+      - name: Record dispatch-chain proof
+        run: |
+          echo '## Orchestrator A2A Dispatch Chain Proof' >> "$GITHUB_STEP_SUMMARY"
+          echo '- One inbound request reached Orchestrator Agent.' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Orchestrator performed A2A handoffs to Planner -> Maker -> Checker -> Reflector.' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Every role reasoning/provider remained NOT_INVOKED.' >> "$GITHUB_STEP_SUMMARY"
+          echo '- Maker actuators stayed disconnected; Checker mutation stayed disallowed; Reflector did not dispatch.' >> "$GITHUB_STEP_SUMMARY"
