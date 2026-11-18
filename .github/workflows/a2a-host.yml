@@ -1,0 +1,77 @@
+name: Orchestrator A2A Host Proof
+
+on:
+  push:
+    branches:
+      - "claude/a2a-service-host"
+  pull_request:
+    paths:
+      - "services/a2a/**"
+      - ".github/workflows/a2a-host.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  a2a-host-proof:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Build A2A host
+        run: dotnet build services/a2a/OrchestratorAgent.Host/OrchestratorAgent.Host.csproj --configuration Release --nologo
+
+      - name: Build A2A probe
+        run: dotnet build services/a2a/OrchestratorAgent.Probe/OrchestratorAgent.Probe.csproj --configuration Release --nologo
+
+      - name: Start Orchestrator A2A host
+        env:
+          ASPNETCORE_URLS: http://127.0.0.1:5091
+          A2A_PUBLIC_BASE_URL: http://127.0.0.1:5091
+        run: |
+          dotnet run             --project services/a2a/OrchestratorAgent.Host/OrchestratorAgent.Host.csproj             --configuration Release             --no-build             > /tmp/orchestrator-a2a.log 2>&1 &
+          echo $! > /tmp/orchestrator-a2a.pid
+
+      - name: Wait for host health
+        run: |
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:5091/healthz > /tmp/health.json; then
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/orchestrator-a2a.log
+          exit 1
+
+      - name: Verify well-known agent card
+        run: |
+          curl --fail --silent             http://127.0.0.1:5091/.well-known/agent-card.json             | tee /tmp/agent-card.json
+          python3 - <<'PY'
+          import json
+          card=json.load(open('/tmp/agent-card.json'))
+          assert card['name'] == 'PMCR-O Orchestrator Agent'
+          assert any(
+              interface.get('protocolVersion') == '1.0'
+              for interface in card.get('supportedInterfaces', [])
+          )
+          print('PASS agent-card discovery')
+          PY
+
+      - name: Invoke through official A2A client
+        run: |
+          dotnet run             --project services/a2a/OrchestratorAgent.Probe/OrchestratorAgent.Probe.csproj             --configuration Release             --no-build             -- http://127.0.0.1:5091
+
+      - name: Stop host
+        if: always()
+        run: |
+          test ! -f /tmp/orchestrator-a2a.pid || kill "$(cat /tmp/orchestrator-a2a.pid)" || true
+          cat /tmp/orchestrator-a2a.log || true
+
+      - name: Proof summary
+        run: |
+          printf '%s\n'             '## Orchestrator A2A Host Proof'             '- ASP.NET Core A2A host compiled and started.'             '- Well-known agent card resolved.'             '- Official Agent Framework A2A client sent a real message.'             '- Response was deliberately NOT_INVOKED for PMCR-O reasoning/provider execution.'             '- This proves A2A transport only; it does not prove native Orchestrator reasoning.'             >> "$GITHUB_STEP_SUMMARY"
